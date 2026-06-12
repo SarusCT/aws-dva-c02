@@ -1,0 +1,317 @@
+/* ============ Giáo trình AWS DVA-C02 — "sổ tay kỹ thuật" ============ */
+
+:root {
+  --paper: #f7f2e9;
+  --paper-raise: #fffdf8;
+  --ink: #211c14;
+  --ink-soft: #5c5648;
+  --ink-faint: #8a8273;
+  --line: #e2d9c8;
+  --accent: #d96f0e;          /* cam AWS đã trầm lại cho nền giấy */
+  --accent-ink: #9c4f06;
+  --accent-wash: #f7e5cf;
+  --tip-wash: #f9ecd6;
+  --code-bg: #2b2620;
+  --code-ink: #efe7d8;
+  --sidebar-bg: #211c14;
+  --sidebar-ink: #d8d0bf;
+  --sidebar-faint: #918a79;
+  --sidebar-line: #383228;
+  --shadow: 0 2px 24px rgba(60, 45, 20, .10);
+  --serif: "Literata", Georgia, serif;
+  --sans: "Be Vietnam Pro", -apple-system, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+html[data-theme="dark"] {
+  --paper: #16140f;
+  --paper-raise: #1d1a14;
+  --ink: #e8e1d2;
+  --ink-soft: #a89f8c;
+  --ink-faint: #756d5c;
+  --line: #2e2a21;
+  --accent: #f59e2d;
+  --accent-ink: #f5b35d;
+  --accent-wash: #2c2114;
+  --tip-wash: #251e12;
+  --code-bg: #211e17;
+  --code-ink: #e8e1d2;
+  --sidebar-bg: #100e0a;
+  --sidebar-ink: #cfc7b5;
+  --sidebar-faint: #7d7665;
+  --sidebar-line: #262219;
+  --shadow: 0 2px 24px rgba(0, 0, 0, .45);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  display: flex;
+  min-height: 100vh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  /* vân giấy rất nhẹ */
+  background-image: radial-gradient(rgba(120, 95, 50, .05) 1px, transparent 1px);
+  background-size: 22px 22px;
+  transition: background-color .25s, color .25s;
+}
+
+/* ---------- thanh tiến độ đọc ---------- */
+.progress-track {
+  position: fixed; top: 0; left: 0; right: 0; height: 3px;
+  background: transparent; z-index: 60;
+}
+.progress-bar {
+  height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--accent), #ffce73);
+}
+
+/* ---------- sidebar ---------- */
+.sidebar {
+  width: 318px; flex-shrink: 0;
+  position: sticky; top: 0; height: 100vh;
+  display: flex; flex-direction: column;
+  background: var(--sidebar-bg);
+  color: var(--sidebar-ink);
+  font-family: var(--sans);
+  border-right: 1px solid var(--sidebar-line);
+}
+.sidebar-head { padding: 22px 20px 14px; border-bottom: 1px solid var(--sidebar-line); }
+.brand-mark {
+  display: block;
+  font-weight: 900; font-size: 34px; letter-spacing: -.5px;
+  color: #fff;
+}
+.brand-mark i { font-style: normal; color: var(--accent); }
+.brand-sub {
+  display: block; margin-top: 4px;
+  font-size: 11.5px; line-height: 1.45;
+  color: var(--sidebar-faint);
+  text-transform: uppercase; letter-spacing: .08em;
+}
+.sidebar-tools { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
+#searchBox {
+  flex: 1; padding: 7px 11px;
+  background: rgba(255,255,255,.06);
+  border: 1px solid var(--sidebar-line); border-radius: 7px;
+  color: var(--sidebar-ink); font-family: var(--sans); font-size: 13px;
+  outline: none;
+}
+#searchBox:focus { border-color: var(--accent); }
+.done-count { font-family: var(--mono); font-size: 11px; color: var(--accent); white-space: nowrap; }
+
+.toc { flex: 1; overflow-y: auto; padding: 10px 0 24px; scrollbar-width: thin; scrollbar-color: var(--sidebar-line) transparent; }
+.toc-part {
+  margin: 18px 20px 6px;
+  font-size: 10.5px; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase;
+  color: var(--accent);
+  display: flex; align-items: baseline; gap: 8px;
+}
+.toc-part::after { content: ""; flex: 1; height: 1px; background: var(--sidebar-line); }
+.toc a {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 6px 20px 6px 18px;
+  color: var(--sidebar-ink); text-decoration: none;
+  font-size: 13.5px; line-height: 1.4;
+  border-left: 2px solid transparent;
+}
+.toc a:hover { background: rgba(255,255,255,.05); }
+.toc a.active {
+  border-left-color: var(--accent);
+  background: rgba(245, 158, 45, .10);
+  color: #fff; font-weight: 600;
+}
+.toc a .n {
+  font-family: var(--mono); font-size: 11px;
+  color: var(--sidebar-faint); min-width: 20px;
+}
+.toc a.active .n { color: var(--accent); }
+.toc a .done-dot { margin-left: auto; color: var(--accent); font-size: 11px; }
+.toc a.hidden { display: none; }
+.sidebar-foot {
+  padding: 12px 20px; border-top: 1px solid var(--sidebar-line);
+  font-size: 11px; color: var(--sidebar-faint); font-family: var(--mono);
+}
+
+/* ---------- cột chính ---------- */
+.main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.topbar {
+  position: sticky; top: 0; z-index: 40;
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 22px;
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--sans);
+}
+.topbar-crumb { font-size: 13px; color: var(--ink-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar-spacer { flex: 1; }
+.icon-btn {
+  border: 1px solid var(--line); background: var(--paper-raise);
+  color: var(--ink); border-radius: 8px;
+  width: 34px; height: 34px; font-size: 16px; cursor: pointer;
+}
+.icon-btn:hover { border-color: var(--accent); color: var(--accent-ink); }
+#menuBtn { display: none; }
+
+.content { max-width: 860px; width: 100%; margin: 0 auto; padding: 40px 48px 90px; }
+
+/* ---------- bài đọc ---------- */
+.reader { font-size: 17px; line-height: 1.78; }
+.reader > *:first-child { margin-top: 0; }
+
+.reader h1 {
+  font-family: var(--sans); font-weight: 800;
+  font-size: 38px; line-height: 1.18; letter-spacing: -.5px;
+  margin: 8px 0 18px;
+}
+.reader h1::before {
+  content: ""; display: block; width: 64px; height: 5px;
+  background: var(--accent); margin-bottom: 22px; border-radius: 2px;
+}
+.reader h2 {
+  font-family: var(--sans); font-weight: 700;
+  font-size: 25px; letter-spacing: -.2px;
+  margin: 52px 0 14px; padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.reader h3 { font-family: var(--sans); font-weight: 600; font-size: 19px; margin: 34px 0 10px; }
+.reader h4 { font-family: var(--sans); font-weight: 600; font-size: 16px; margin: 26px 0 8px; }
+.reader p { margin: 0 0 16px; }
+.reader li { margin: 5px 0; }
+.reader strong { font-weight: 700; }
+.reader a { color: var(--accent-ink); text-decoration-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+.reader hr { border: 0; border-top: 1px solid var(--line); margin: 36px 0; }
+.reader img { max-width: 100%; }
+
+/* code */
+.reader code {
+  font-family: var(--mono); font-size: .82em;
+  background: var(--accent-wash); color: var(--accent-ink);
+  padding: 2px 6px; border-radius: 5px;
+}
+.reader pre {
+  background: var(--code-bg); color: var(--code-ink);
+  border-radius: 10px; padding: 18px 20px;
+  overflow-x: auto; margin: 18px 0;
+  border: 1px solid color-mix(in srgb, var(--code-bg) 70%, #fff 8%);
+  box-shadow: var(--shadow);
+}
+.reader pre code {
+  background: none; color: inherit; padding: 0;
+  font-size: 13.5px; line-height: 1.6;
+}
+
+/* bảng */
+.reader table {
+  width: 100%; border-collapse: collapse; margin: 20px 0;
+  font-family: var(--sans); font-size: 14px; line-height: 1.55;
+  background: var(--paper-raise);
+  box-shadow: var(--shadow); border-radius: 10px; overflow: hidden;
+  display: block; overflow-x: auto;
+}
+.reader th {
+  text-align: left; padding: 11px 14px;
+  background: var(--ink); color: var(--paper);
+  font-weight: 600; white-space: nowrap;
+}
+html[data-theme="dark"] .reader th { background: #2c2718; color: var(--ink); }
+.reader td { padding: 10px 14px; border-top: 1px solid var(--line); vertical-align: top; }
+.reader tr:nth-child(even) td { background: color-mix(in srgb, var(--accent-wash) 30%, transparent); }
+
+/* blockquote thường */
+.reader blockquote {
+  margin: 18px 0; padding: 4px 22px;
+  border-left: 3px solid var(--ink-faint);
+  color: var(--ink-soft); font-style: italic;
+}
+/* exam tip & trọng tâm */
+.reader blockquote.tip, .reader blockquote.focus {
+  font-style: normal; color: var(--ink);
+  background: var(--tip-wash);
+  border-left: 4px solid var(--accent);
+  border-radius: 0 10px 10px 0;
+  padding: 14px 20px;
+}
+.reader blockquote.tip p, .reader blockquote.focus p { margin: 6px 0; }
+
+/* đáp án quiz tự gập */
+.reader details.answers {
+  margin: 20px 0; border: 1px dashed var(--accent);
+  border-radius: 10px; padding: 0 20px;
+  background: color-mix(in srgb, var(--accent-wash) 55%, transparent);
+}
+.reader details.answers > summary {
+  cursor: pointer; list-style: none;
+  font-family: var(--sans); font-weight: 700; font-size: 15px;
+  color: var(--accent-ink); padding: 14px 0;
+}
+.reader details.answers > summary::before { content: "▸ "; }
+.reader details.answers[open] > summary::before { content: "▾ "; }
+.reader details.answers[open] { padding-bottom: 14px; }
+
+/* trạng thái tải */
+.loading, .missing {
+  font-family: var(--sans); color: var(--ink-soft);
+  text-align: center; padding: 90px 20px;
+}
+.missing .big { font-size: 44px; display: block; margin-bottom: 14px; }
+
+/* nút hoàn thành + điều hướng chương */
+.done-btn {
+  display: inline-block; margin: 30px 0 0;
+  font-family: var(--sans); font-weight: 600; font-size: 14px;
+  padding: 10px 20px; border-radius: 9px; cursor: pointer;
+  border: 1.5px solid var(--accent); background: transparent; color: var(--accent-ink);
+}
+.done-btn.is-done { background: var(--accent); color: #fff; }
+.chapter-nav {
+  display: flex; gap: 14px; margin-top: 46px;
+  font-family: var(--sans);
+}
+.chapter-nav a {
+  flex: 1; text-decoration: none;
+  border: 1px solid var(--line); border-radius: 12px;
+  padding: 14px 18px; background: var(--paper-raise);
+  color: var(--ink); box-shadow: var(--shadow);
+}
+.chapter-nav a:hover { border-color: var(--accent); }
+.chapter-nav a.next { text-align: right; }
+.chapter-nav .dir { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--ink-faint); margin-bottom: 4px; }
+.chapter-nav .ttl { font-weight: 600; font-size: 14.5px; }
+
+.scrim { display: none; }
+
+/* ---------- mobile ---------- */
+@media (max-width: 900px) {
+  .sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0; z-index: 70;
+    transform: translateX(-100%); transition: transform .25s ease;
+    width: min(320px, 86vw);
+  }
+  body.nav-open .sidebar { transform: translateX(0); }
+  body.nav-open .scrim {
+    display: block; position: fixed; inset: 0; z-index: 65;
+    background: rgba(10, 8, 4, .5);
+  }
+  #menuBtn { display: inline-block; }
+  .content { padding: 26px 20px 70px; }
+  .reader { font-size: 16px; }
+  .reader h1 { font-size: 29px; }
+}
+
+/* ---------- in / xuất PDF ---------- */
+@media print {
+  .sidebar, .topbar, .progress-track, .chapter-nav, .done-btn, .scrim { display: none !important; }
+  body { background: #fff; color: #000; display: block; }
+  .content { max-width: none; padding: 0; }
+  .reader { font-size: 11.5pt; line-height: 1.6; }
+  .reader pre { box-shadow: none; border: 1px solid #ccc; background: #f6f6f6; color: #111; white-space: pre-wrap; }
+  .reader details.answers { border: 1px solid #999; }
+  .reader details.answers > summary { display: none; }
+  .reader details.answers > * { display: block; }
+}

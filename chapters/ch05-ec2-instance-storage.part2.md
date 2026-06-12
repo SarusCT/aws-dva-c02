@@ -1,0 +1,331 @@
+## Hands-on Lab: EBS gp3 từ A–Z, snapshot mã hoá & mount EFS đa AZ
+
+**Mục tiêu lab:** Tạo và gắn EBS gp3 volume vào EC2, tăng IOPS/throughput online bằng Elastic Volumes, tạo snapshot rồi copy thành snapshot mã hoá, restore sang AZ khác; sau đó tạo EFS file system với mount target ở 2 AZ và mount đồng thời từ 2 instance để thấy rõ khác biệt EBS (block, 1 AZ) vs EFS (file, đa AZ).
+
+**Chuẩn bị:**
+- AWS CLI v2 đã cấu hình (chi tiết ở Chương 3), region ví dụ `ap-southeast-1`.
+- 2 EC2 instance Amazon Linux 2023 loại `t3.micro` ở 2 AZ khác nhau (`ap-southeast-1a` và `ap-southeast-1b`), đã gắn Security Group cho phép SSH (cách launch ở Chương 4). Gọi chúng là `instance-a` và `instance-b`.
+- Lab tốn ~0.1–0.3 USD nếu dọn dẹp trong vòng 1–2 giờ. **Nhớ làm mục Dọn dẹp tài nguyên.**
+
+Lưu instance ID và AZ vào biến để dùng xuyên suốt:
+
+```bash
+INSTANCE_A=i-0aaaa1111bbbb2222   # thay bằng ID thật của bạn
+INSTANCE_B=i-0cccc3333dddd4444
+AZ_A=ap-southeast-1a
+AZ_B=ap-southeast-1b
+```
+
+### Bước 1: Tạo EBS gp3 volume và gắn vào instance-a
+
+```bash
+VOLUME_ID=$(aws ec2 create-volume \
+  --availability-zone $AZ_A \
+  --size 10 \
+  --volume-type gp3 \
+  --iops 3000 \
+  --throughput 125 \
+  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=lab-ch05}]' \
+  --query 'VolumeId' --output text)
+
+aws ec2 wait volume-available --volume-ids $VOLUME_ID
+
+aws ec2 attach-volume \
+  --volume-id $VOLUME_ID \
+  --instance-id $INSTANCE_A \
+  --device /dev/sdf
+```
+
+Output mong đợi của `attach-volume`:
+
+```json
+{
+    "AttachTime": "2026-06-12T03:15:20+00:00",
+    "Device": "/dev/sdf",
+    "InstanceId": "i-0aaaa1111bbbb2222",
+    "State": "attaching",
+    "VolumeId": "vol-0123456789abcdef0"
+}
+```
+
+Lưu ý: gp3 có **baseline 3000 IOPS và 125 MiB/s miễn phí bất kể size** — khác gp2 (IOPS tỉ lệ size, 3 IOPS/GiB). Volume chỉ tạo được trong đúng 1 AZ; nếu bạn cố attach volume ở `1a` vào instance ở `1b`, API trả lỗi `InvalidVolume.ZoneMismatch`.
+
+### Bước 2: Format và mount trên instance-a
+
+SSH vào instance-a (hoặc dùng EC2 Instance Connect), rồi:
+
+```bash
+lsblk
+# Trên Nitro instance, /dev/sdf hiện ra là /dev/nvme1n1
+sudo mkfs -t xfs /dev/nvme1n1
+sudo mkdir /data
+sudo mount /dev/nvme1n1 /data
+echo "hello ebs" | sudo tee /data/test.txt
+df -h /data
+```
+
+Output mong đợi của `df -h /data`:
+
+```
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme1n1     10G  104M  9.9G   2% /data
+```
+
+Bẫy thực tế: tên device bạn khai (`/dev/sdf`) bị NVMe driver đổi thành `/dev/nvme1n1`. Đừng hardcode tên NVMe trong `/etc/fstab` vì thứ tự enumerate có thể đổi sau reboot — dùng UUID (`sudo blkid`) thay thế.
+
+### Bước 3: Tăng performance online với Elastic Volumes
+
+Không cần detach, không downtime:
+
+```bash
+aws ec2 modify-volume --volume-id $VOLUME_ID \
+  --size 20 --iops 4000 --throughput 250
+
+aws ec2 describe-volumes-modifications --volume-ids $VOLUME_ID \
+  --query 'VolumesModifications[0].ModificationState'
+```
+
+Output: `"optimizing"` rồi chuyển `"completed"`. Trên instance phải tự grow filesystem: `sudo xfs_growfs /data`. Bẫy hay gặp trong đề: sau khi modify volume, phải chờ **6 giờ** mới được modify tiếp volume đó (cooldown); và size chỉ tăng được, **không giảm** được.
+
+### Bước 4: Snapshot và copy thành snapshot mã hoá
+
+```bash
+SNAP_ID=$(aws ec2 create-snapshot \
+  --volume-id $VOLUME_ID \
+  --description "lab ch05 snapshot" \
+  --query 'SnapshotId' --output text)
+
+aws ec2 wait snapshot-completed --snapshot-ids $SNAP_ID
+
+# Copy + mã hoá bằng KMS key mặc định aws/ebs
+ENC_SNAP_ID=$(aws ec2 copy-snapshot \
+  --source-region ap-southeast-1 \
+  --source-snapshot-id $SNAP_ID \
+  --encrypted \
+  --query 'SnapshotId' --output text)
+```
+
+Snapshot là **incremental** và lưu trên S3 (do AWS quản lý, bạn không thấy bucket). Đây chính là cách chuẩn để mã hoá một volume unencrypted: snapshot → copy có `--encrypted` → tạo volume mới từ snapshot mã hoá. Không có cách "bật encryption tại chỗ" cho volume đang chạy.
+
+### Bước 5: Restore volume mã hoá sang AZ khác
+
+```bash
+aws ec2 wait snapshot-completed --snapshot-ids $ENC_SNAP_ID
+
+NEW_VOL=$(aws ec2 create-volume \
+  --availability-zone $AZ_B \
+  --snapshot-id $ENC_SNAP_ID \
+  --volume-type gp3 \
+  --query 'VolumeId' --output text)
+
+aws ec2 describe-volumes --volume-ids $NEW_VOL \
+  --query 'Volumes[0].{AZ:AvailabilityZone,Encrypted:Encrypted,State:State}'
+```
+
+Output mong đợi:
+
+```json
+{
+    "AZ": "ap-southeast-1b",
+    "Encrypted": true,
+    "State": "available"
+}
+```
+
+Đây là pattern thi hay hỏi: **snapshot là cách duy nhất "di chuyển" EBS qua AZ/region**. Nếu cần đọc dữ liệu restore với full performance ngay (không chờ lazy-load từ S3), bật Fast Snapshot Restore — nhưng FSR tính phí theo giờ/AZ, khá đắt.
+
+### Bước 6: Tạo EFS và mount targets ở 2 AZ
+
+```bash
+FS_ID=$(aws efs create-file-system \
+  --performance-mode generalPurpose \
+  --throughput-mode elastic \
+  --encrypted \
+  --tags Key=Name,Value=lab-ch05-efs \
+  --query 'FileSystemId' --output text)
+
+# Lấy subnet của từng instance
+SUBNET_A=$(aws ec2 describe-instances --instance-ids $INSTANCE_A \
+  --query 'Reservations[0].Instances[0].SubnetId' --output text)
+SUBNET_B=$(aws ec2 describe-instances --instance-ids $INSTANCE_B \
+  --query 'Reservations[0].Instances[0].SubnetId' --output text)
+
+# Security Group cho EFS: mở TCP 2049 (NFS) từ SG của instances
+EFS_SG=$(aws ec2 create-security-group --group-name lab-efs-sg \
+  --description "NFS for lab" --query 'GroupId' --output text)
+INSTANCE_SG=$(aws ec2 describe-instances --instance-ids $INSTANCE_A \
+  --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id $EFS_SG \
+  --protocol tcp --port 2049 --source-group $INSTANCE_SG
+
+# Mount target mỗi AZ một cái
+aws efs create-mount-target --file-system-id $FS_ID \
+  --subnet-id $SUBNET_A --security-groups $EFS_SG
+aws efs create-mount-target --file-system-id $FS_ID \
+  --subnet-id $SUBNET_B --security-groups $EFS_SG
+```
+
+Chờ mount target sang `available`:
+
+```bash
+aws efs describe-mount-targets --file-system-id $FS_ID \
+  --query 'MountTargets[].{AZ:AvailabilityZoneName,State:LifeCycleState}'
+```
+
+Điểm cốt lõi: EFS là dịch vụ regional, nhưng instance kết nối qua **mount target** — một ENI trong subnet của từng AZ. Cổng giao tiếp là NFS 4.1, TCP 2049. Quên mở port 2049 trên SG của mount target là lỗi "mount hangs" kinh điển.
+
+### Bước 7: Mount đồng thời từ 2 instance ở 2 AZ
+
+Trên **cả instance-a và instance-b** (cài amazon-efs-utils để mount qua helper, hỗ trợ TLS):
+
+```bash
+sudo dnf -y install amazon-efs-utils
+sudo mkdir -p /shared
+sudo mount -t efs -o tls fs-0123456789abcdef0:/ /shared   # thay FS_ID của bạn
+```
+
+Trên instance-a: `echo "from A" | sudo tee /shared/a.txt`. Trên instance-b: `cat /shared/a.txt` → in ra `from A` ngay lập tức. Đây là điều EBS **không làm được** (trừ io1/io2 Multi-Attach trong cùng AZ với cluster-aware filesystem — không phải POSIX sharing thông thường).
+
+### Dọn dẹp tài nguyên
+
+Làm đúng thứ tự, tránh bị phí treo:
+
+```bash
+# 1. Unmount trên cả 2 instance: sudo umount /shared /data
+
+# 2. Xoá EFS (phải xoá mount targets trước)
+for MT in $(aws efs describe-mount-targets --file-system-id $FS_ID \
+  --query 'MountTargets[].MountTargetId' --output text); do
+  aws efs delete-mount-target --mount-target-id $MT
+done
+sleep 60
+aws efs delete-file-system --file-system-id $FS_ID
+aws ec2 delete-security-group --group-id $EFS_SG
+
+# 3. Detach & xoá volumes
+aws ec2 detach-volume --volume-id $VOLUME_ID
+aws ec2 wait volume-available --volume-ids $VOLUME_ID
+aws ec2 delete-volume --volume-id $VOLUME_ID
+aws ec2 delete-volume --volume-id $NEW_VOL
+
+# 4. Xoá snapshots
+aws ec2 delete-snapshot --snapshot-id $SNAP_ID
+aws ec2 delete-snapshot --snapshot-id $ENC_SNAP_ID
+
+# 5. Terminate instances nếu không dùng tiếp cho chương sau
+aws ec2 terminate-instances --instance-ids $INSTANCE_A $INSTANCE_B
+```
+
+Kiểm tra lại bằng `aws ec2 describe-volumes --filters Name=tag:Name,Values=lab-ch05` — kết quả phải rỗng.
+
+## 💡 Exam Tips chương 5
+
+- **gp2 → gp3**: gp3 cho phép cấu hình IOPS (3000–16000) và throughput (125–1000 MiB/s) **độc lập với size**; gp2 thì IOPS gắn với size (3 IOPS/GiB, burst tới 3000). Câu "tăng IOPS mà không tăng dung lượng, chi phí thấp nhất" → gp3.
+- Cần **> 16.000 IOPS** hoặc latency dưới mili giây cho database → io1/io2 (Provisioned IOPS, tối đa 64.000 IOPS trên Nitro, io2 Block Express tới 256.000). gp3 không bao giờ vượt 16.000.
+- **st1/sc1** là HDD throughput-optimized/cold: không làm boot volume được, không phù hợp small random I/O; dùng cho big data, log processing tuần tự.
+- EBS volume **bị khoá trong 1 AZ**. Di chuyển qua AZ/region = snapshot rồi tạo volume mới (copy snapshot nếu sang region khác). Đề hỏi "move volume to another AZ" → snapshot, không có đáp án "detach rồi attach".
+- Mã hoá volume đang unencrypted: snapshot → **copy snapshot với encryption bật** → create volume từ snapshot mới. Snapshot của volume mã hoá thì tự động mã hoá; không thể "unencrypt".
+- Bật **Encryption by default** ở cấp region thì mọi volume/snapshot mới tự mã hoá; encryption dùng KMS (chi tiết KMS ở Chương 46) và trong suốt với ứng dụng, không ảnh hưởng đáng kể latency.
+- **EBS Multi-Attach** chỉ cho io1/io2, tối đa 16 Nitro instances, **cùng AZ**, và cần cluster-aware filesystem — không phải giải pháp shared file system thông thường. "Shared POSIX file system across AZs" → EFS.
+- **Instance Store**: ephemeral, mất dữ liệu khi stop/hibernate/terminate (reboot thì còn); IOPS rất cao (hàng trăm nghìn đến hàng triệu); dùng cho buffer/cache/scratch data. Không snapshot trực tiếp được.
+- **EFS chỉ cho Linux** (NFS 4.1), pay-per-use, scale tự động, mount đa AZ qua mount target + SG mở TCP 2049. Windows shared storage → FSx (ngoài phạm vi chương).
+- EFS performance modes: **General Purpose** (latency thấp, mặc định, dùng cho web/CMS) vs **Max I/O** (throughput/IOPS tổng cao hơn nhưng latency cao hơn, big data). Chọn lúc tạo, không đổi được (Max I/O không khả dụng với Elastic throughput).
+- EFS throughput modes: **Elastic** (mặc định, auto scale — chọn khi workload khó đoán), **Provisioned** (cố định throughput bất kể size), **Bursting** (theo size). EFS storage classes + lifecycle policy (IA, Archive) tiết kiệm tới ~90% chi phí cho file ít truy cập.
+- Snapshot tiết kiệm chi phí dài hạn: **EBS Snapshots Archive** (rẻ hơn ~75%, restore mất 24–72 giờ) và **Recycle Bin** (giữ snapshot đã xoá theo retention rule 1 ngày–1 năm). **FSR** = restore không cần warm-up nhưng đắt.
+
+## Quiz chương 5 (10 câu)
+
+**Câu 1.** Một ứng dụng database trên EC2 cần 10.000 IOPS ổn định trên volume 200 GiB. Giải pháp **chi phí thấp nhất**?
+- A. gp2 200 GiB
+- B. gp3 200 GiB với provisioned 10.000 IOPS
+- C. io1 200 GiB với 10.000 IOPS
+- D. io2 200 GiB với 10.000 IOPS
+
+**Câu 2.** A developer needs to move một EBS volume từ AZ `us-east-1a` sang `us-east-1b`. Cách đúng?
+- A. Detach volume và attach vào instance ở `us-east-1b`
+- B. Dùng EBS Multi-Attach để gắn vào instance ở cả hai AZ
+- C. Tạo snapshot, rồi tạo volume mới từ snapshot trong `us-east-1b`
+- D. Bật cross-AZ replication trên volume
+
+**Câu 3.** Một volume gp2 đang chứa dữ liệu nhạy cảm nhưng **chưa mã hoá**. Yêu cầu: dữ liệu phải được mã hoá at rest. Quy trình đúng?
+- A. Bật encryption trong tab cài đặt của volume
+- B. Snapshot volume → copy snapshot với encryption → tạo volume từ snapshot mã hoá → swap volume
+- C. Dùng lệnh `aws ec2 encrypt-volume`
+- D. Attach volume vào instance có IMDSv2 và bật encryption qua user data
+
+**Câu 4.** Ứng dụng xử lý video cần **scratch space tạm** với IOPS cực cao; dữ liệu có thể tạo lại nếu mất. Storage nào phù hợp nhất?
+- A. io2 Block Express
+- B. Instance Store
+- C. EFS Max I/O
+- D. gp3 với 16.000 IOPS
+
+**Câu 5.** A developer needs một shared file system POSIX cho fleet EC2 Linux chạy ở **3 AZ**, ghi/đọc đồng thời. Chọn gì?
+- A. EBS io2 Multi-Attach
+- B. EBS gp3 gắn lần lượt từng instance
+- C. Amazon EFS với mount target ở mỗi AZ
+- D. Instance Store chia sẻ qua NFS tự dựng
+
+**Câu 6.** Team mount EFS từ EC2 nhưng lệnh mount bị **treo (hang)** rồi timeout. Nguyên nhân khả dĩ nhất?
+- A. EFS chưa bật encryption
+- B. Security group của mount target không cho phép inbound TCP 2049 từ instance
+- C. Instance dùng IMDSv1 thay vì IMDSv2
+- D. EFS đang ở chế độ Bursting throughput nên hết burst credits
+
+**Câu 7.** Sau khi tạo volume 500 GiB từ snapshot, ứng dụng bị **latency cao ở lần đọc đầu tiên** từng block. Cách loại bỏ hoàn toàn hiện tượng này cho các lần restore sau?
+- A. Đổi volume sang io2
+- B. Bật Fast Snapshot Restore (FSR) cho snapshot ở AZ đích
+- C. Tăng throughput gp3 lên 1000 MiB/s
+- D. Bật EBS encryption
+
+**Câu 8.** Yêu cầu lưu snapshot tuân thủ audit, hiếm khi restore, giảm tối đa chi phí lưu trữ; chấp nhận thời gian restore tính bằng **giờ**. Chọn gì?
+- A. EBS Snapshots Archive
+- B. Fast Snapshot Restore
+- C. Recycle Bin với retention 1 năm
+- D. Copy snapshot sang region rẻ hơn
+
+**Câu 9.** Một web app trên EFS có hàng nghìn file ít khi đọc lại sau 30 ngày. Cách **giảm chi phí** ít công sức vận hành nhất?
+- A. Cron job copy file cũ sang S3 Glacier
+- B. Bật EFS lifecycle policy chuyển sang EFS Infrequent Access sau 30 ngày
+- C. Chuyển sang EBS sc1
+- D. Giảm provisioned throughput của EFS
+
+**Câu 10.** A developer cần 2 instance trong **cùng một AZ** cùng ghi vào một volume cho cluster database có cluster-aware filesystem. Chọn gì?
+- A. gp3 với Multi-Attach
+- B. io2 với Multi-Attach
+- C. EFS performance mode Max I/O
+- D. st1 attach vào cả hai instance
+
+### Đáp án & giải thích
+
+**Câu 1 — Đáp án B.** gp3 cho provision IOPS độc lập với size: 200 GiB + 10.000 IOPS nằm trong trần 16.000 của gp3 và rẻ hơn io1/io2 đáng kể. **A sai:** gp2 200 GiB chỉ có baseline 600 IOPS (3 IOPS/GiB), burst 3000 không ổn định ở mức 10.000. **C, D sai:** io1/io2 đáp ứng được nhưng giá per-IOPS cao hơn gp3 nhiều — đề hỏi "chi phí thấp nhất".
+
+**Câu 2 — Đáp án C.** Snapshot lưu trên S3 và không gắn AZ, nên restore được sang AZ bất kỳ trong region. **A sai:** volume bị khoá trong AZ tạo ra nó, attach cross-AZ trả lỗi `ZoneMismatch`. **B sai:** Multi-Attach chỉ hoạt động trong **cùng** AZ và chỉ với io1/io2. **D sai:** không tồn tại tính năng cross-AZ replication cho EBS volume.
+
+**Câu 3 — Đáp án B.** Không thể bật mã hoá tại chỗ; flow chuẩn là snapshot → copy có `--encrypted` → tạo volume mới → detach volume cũ, attach volume mới. **A, C sai:** không có toggle/API như vậy. **D sai:** IMDSv2 và user data không liên quan gì đến encryption at rest của EBS.
+
+**Câu 4 — Đáp án B.** Instance Store là physically attached NVMe, IOPS cao nhất trong các lựa chọn, miễn phí kèm instance type, và "dữ liệu tạo lại được" khớp với tính ephemeral. **A sai:** io2 Block Express rất nhanh nhưng đắt và thừa độ bền cho scratch data. **C sai:** EFS là network file system, latency cao hơn hẳn local NVMe. **D sai:** gp3 trần 16.000 IOPS, vẫn là network storage, không "cực cao".
+
+**Câu 5 — Đáp án C.** EFS là managed NFS regional, mount đồng thời từ hàng trăm/nghìn instance qua mount target ở mỗi AZ — đúng yêu cầu POSIX + đa AZ. **A sai:** Multi-Attach giới hạn cùng AZ, tối đa 16 instances, cần cluster filesystem. **B sai:** EBS chỉ attach một instance tại một thời điểm (trừ Multi-Attach), không phải shared. **D sai:** Instance Store mất dữ liệu khi stop, tự dựng NFS là single point of failure và overhead vận hành lớn.
+
+**Câu 6 — Đáp án B.** Triệu chứng mount treo/timeout với EFS gần như luôn do SG của mount target chặn NFS port 2049 (hoặc NACL). **A sai:** encryption không ảnh hưởng khả năng mount. **C sai:** IMDS phục vụ metadata, không liên quan NFS. **D sai:** hết burst credits gây throughput chậm, không làm mount fail.
+
+**Câu 7 — Đáp án B.** Volume restore từ snapshot lazy-load block từ S3 → first-read penalty; FSR khởi tạo sẵn (pre-warm) toàn bộ block ở AZ được bật nên volume đạt full performance ngay. **A, C sai:** đổi volume type hay tăng throughput không loại bỏ việc block chưa được hydrate từ S3. **D sai:** encryption không liên quan đến lazy loading.
+
+**Câu 8 — Đáp án A.** Snapshots Archive đưa snapshot sang tier lưu trữ rẻ hơn ~75%, đổi lại restore mất 24–72 giờ — khớp "hiếm restore, chấp nhận chờ". **B sai:** FSR là tính năng tăng tốc restore và **tốn thêm tiền**, ngược yêu cầu. **C sai:** Recycle Bin là lưới an toàn chống xoá nhầm, không giảm chi phí lưu trữ. **D sai:** copy cross-region nhân đôi chi phí lưu và thêm phí transfer.
+
+**Câu 9 — Đáp án B.** Lifecycle policy của EFS tự chuyển file không truy cập sau N ngày sang EFS-IA (rẻ hơn tới ~92%), zero code, file vẫn trong cùng namespace. **A sai:** cron + Glacier là tự chế, thay đổi đường dẫn truy cập file, nhiều công vận hành. **C sai:** sc1 là block storage 1 AZ, mất tính shared file system. **D sai:** throughput không phải thành phần chi phí lưu trữ chính ở đây, và giảm nó ảnh hưởng performance.
+
+**Câu 10 — Đáp án B.** Multi-Attach chỉ hỗ trợ io1/io2, cho tối đa 16 Nitro instances cùng AZ, đúng kịch bản cluster-aware filesystem. **A sai:** gp3 không hỗ trợ Multi-Attach. **C sai:** EFS là file storage NFS, không phải block volume mà cluster database yêu cầu. **D sai:** st1 không hỗ trợ Multi-Attach và HDD không phù hợp database.
+
+## Tóm tắt chương
+
+- EBS là **network block storage gắn 1 AZ**, persist độc lập với instance; Instance Store là **local NVMe ephemeral** — nhanh nhất nhưng mất dữ liệu khi stop/terminate.
+- Volume types: **gp3** (mặc định nên dùng, 3000 IOPS/125 MiB/s baseline, provision tới 16.000 IOPS độc lập size), **gp2** (IOPS = 3×GiB, burst 3000), **io1/io2** (>16.000 IOPS, sub-ms, Multi-Attach), **st1/sc1** (HDD tuần tự, không boot được).
+- **Elastic Volumes**: tăng size/IOPS/throughput online, không downtime; chỉ tăng size không giảm; cooldown 6 giờ giữa 2 lần modify.
+- **Snapshots** là incremental, lưu trên S3, là cơ chế duy nhất di chuyển volume qua AZ/region và là nền tảng tạo AMI; restore bị first-read latency do lazy loading — FSR khắc phục (có phí).
+- Tiết kiệm snapshot: **Archive** (rẻ ~75%, restore 24–72h), **Recycle Bin** (chống xoá nhầm theo retention rule).
+- **Encryption**: bật khi tạo hoặc qua flow snapshot → encrypted copy → volume mới; mọi thứ sinh ra từ resource mã hoá đều mã hoá; có thể bật encryption-by-default cấp region.
+- **Multi-Attach**: chỉ io1/io2, ≤16 Nitro instances, cùng AZ, cần cluster-aware filesystem — không phải shared file system thông thường.
+- **EFS**: managed NFS 4.1 cho Linux, regional, scale tự động, pay-per-use, mount đa AZ qua mount target (mỗi AZ một ENI, SG mở TCP 2049).
+- EFS performance modes (General Purpose vs Max I/O — chọn lúc tạo) và throughput modes (Elastic/Provisioned/Bursting); storage classes Standard/IA/Archive + lifecycle policy để giảm chi phí.
+- Quy tắc chọn nhanh: block 1 instance → EBS; scratch/cache cực nhanh → Instance Store; shared POSIX đa AZ Linux → EFS; cluster cùng AZ ghi chung block → io1/io2 Multi-Attach.
